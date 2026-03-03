@@ -1,9 +1,11 @@
 import http.server
 import json
 import logging
+import logging.handlers
 import os
 import socketserver
 import sys
+import time
 from http import HTTPStatus
 
 import requests
@@ -14,6 +16,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("ServarrForceImporter")
+
+# Log to file so crashes leave evidence when running as a PyInstaller exe
+try:
+    _log_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    _fh = logging.handlers.RotatingFileHandler(
+        os.path.join(_log_dir, "ServarrForceImporter.log"),
+        maxBytes=5 * 1024 * 1024, backupCount=3,
+    )
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_fh)
+except Exception:
+    pass
 
 
 # Config
@@ -146,42 +160,50 @@ def send_manual_import_command(instance, prepared_files):
 def prepare_sonarr_files(available_files):
     prepared = []
     for f in available_files:
-        series_id = f.get("series", {}).get("id", 0)
-        episode_ids = [ep["id"] for ep in f.get("episodes", [])]
-        if not series_id or not episode_ids:
-            logger.warning("  Skipping (missing seriesId or episodeIds): %s", f.get("path"))
+        try:
+            series_id = f.get("series", {}).get("id", 0)
+            episode_ids = [ep["id"] for ep in f.get("episodes", [])]
+            if not series_id or not episode_ids:
+                logger.warning("  Skipping (missing seriesId or episodeIds): %s", f.get("path"))
+                continue
+            prepared.append({
+                "path": f["path"],
+                "folderName": f.get("folderName", ""),
+                "seriesId": series_id,
+                "episodeIds": episode_ids,
+                "quality": f["quality"],
+                "languages": f.get("languages", [{"id": 1, "name": "English"}]),
+                "releaseGroup": f.get("releaseGroup", ""),
+                "indexerFlags": f.get("indexerFlags", 0),
+                "releaseType": f.get("releaseType", "singleEpisode"),
+                "downloadId": f.get("downloadId", ""),
+            })
+        except (KeyError, TypeError) as e:
+            logger.warning("  Skipping file (bad data): %s — %s", f.get("path", "?"), e)
             continue
-        prepared.append({
-            "path": f["path"],
-            "folderName": f.get("folderName", ""),
-            "seriesId": series_id,
-            "episodeIds": episode_ids,
-            "quality": f["quality"],
-            "languages": f.get("languages", [{"id": 1, "name": "English"}]),
-            "releaseGroup": f.get("releaseGroup", ""),
-            "indexerFlags": f.get("indexerFlags", 0),
-            "releaseType": f.get("releaseType", "singleEpisode"),
-            "downloadId": f.get("downloadId", ""),
-        })
     return prepared
 
 def prepare_radarr_files(available_files):
     prepared = []
     for f in available_files:
-        movie_id = f.get("movie", {}).get("id", 0)
-        if not movie_id:
-            logger.warning("  Skipping (missing movieId): %s", f.get("path"))
+        try:
+            movie_id = f.get("movie", {}).get("id", 0)
+            if not movie_id:
+                logger.warning("  Skipping (missing movieId): %s", f.get("path"))
+                continue
+            prepared.append({
+                "path": f["path"],
+                "folderName": f.get("folderName", ""),
+                "movieId": movie_id,
+                "quality": f["quality"],
+                "languages": f.get("languages", [{"id": 1, "name": "English"}]),
+                "releaseGroup": f.get("releaseGroup", ""),
+                "indexerFlags": f.get("indexerFlags", 0),
+                "downloadId": f.get("downloadId", ""),
+            })
+        except (KeyError, TypeError) as e:
+            logger.warning("  Skipping file (bad data): %s — %s", f.get("path", "?"), e)
             continue
-        prepared.append({
-            "path": f["path"],
-            "folderName": f.get("folderName", ""),
-            "movieId": movie_id,
-            "quality": f["quality"],
-            "languages": f.get("languages", [{"id": 1, "name": "English"}]),
-            "releaseGroup": f.get("releaseGroup", ""),
-            "indexerFlags": f.get("indexerFlags", 0),
-            "downloadId": f.get("downloadId", ""),
-        })
     return prepared
 
 
@@ -263,6 +285,16 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception:
+            logger.exception("Unexpected error handling POST request")
+            try:
+                self._respond("Internal server error.", HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def _handle_post(self):
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             self._respond("Empty body.", HTTPStatus.BAD_REQUEST)
@@ -326,7 +358,9 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
             series = payload.get("series", {})
             episodes = payload.get("episodes", [])
             if episodes:
-                label = f"{series.get('title', '?')} S{episodes[0].get('seasonNumber', '?'):02}E{episodes[0].get('episodeNumber', '?'):02}"
+                sn = episodes[0].get("seasonNumber", 0)
+                en = episodes[0].get("episodeNumber", 0)
+                label = f"{series.get('title', '?')} S{sn:02}E{en:02}"
             else:
                 label = series.get("title", download_id)
         else:
@@ -343,23 +377,8 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode("utf-8"))
 
-def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Listens for Sonarr/Radarr ManualInteractionRequired webhooks and force-imports stuck downloads."
-    )
-    parser.add_argument(
-        "--config",
-        default=os.path.join(
-            os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)),
-            "ServarrForceImporter.json",
-        ),
-        help="Path to JSON config file (default: ServarrForceImporter.json next to the exe/script)",
-    )
-    args = parser.parse_args()
-
-    config = load_config(args.config)
+def _run_service(config):
+    """One run of the service — raises on failure so the retry loop can restart."""
     instances = config["instances"]
     host = config["listen_host"]
     port = config["listen_port"]
@@ -377,8 +396,7 @@ def main():
             resp.raise_for_status()
             logger.info("[%s] Connected OK", inst["name"])
         except requests.RequestException as e:
-            logger.error("[%s] Cannot connect to %s: %s", inst["name"], inst["url"], e)
-            sys.exit(1)
+            raise ConnectionError(f"[{inst['name']}] Cannot connect to {inst['url']}: {e}") from e
 
     # Catch already-stuck items before we start listening
     startup_scan(instances)
@@ -390,13 +408,57 @@ def main():
     logger.info("Configure Sonarr/Radarr webhooks to: http://<this-host>:%d/", port)
 
     try:
+        socketserver.TCPServer.allow_reuse_address = True
         with socketserver.TCPServer((host, port), WebhookHandler) as httpd:
-            httpd.allow_reuse_address = True
             httpd.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down.")
-    except OSError as e:
-        logger.error("Failed to bind to %s:%d - %s", host, port, e)
+
+
+def _run_forever(config):
+    """Retry loop — restarts the service on any failure."""
+    while True:
+        try:
+            _run_service(config)
+            return  # clean shutdown (KeyboardInterrupt caught inside)
+        except KeyboardInterrupt:
+            logger.info("Shutting down.")
+            return
+        except Exception:
+            logger.exception("Service error — restarting in 10s")
+            try:
+                time.sleep(10)
+            except KeyboardInterrupt:
+                logger.info("Shutting down.")
+                return
+
+
+def main():
+    try:
+        import argparse
+
+        parser = argparse.ArgumentParser(
+            description="Listens for Sonarr/Radarr ManualInteractionRequired webhooks and force-imports stuck downloads."
+        )
+        parser.add_argument(
+            "--config",
+            default=os.path.join(
+                os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__)),
+                "ServarrForceImporter.json",
+            ),
+            help="Path to JSON config file (default: ServarrForceImporter.json next to the exe/script)",
+        )
+        args = parser.parse_args()
+
+        config = load_config(args.config)
+        _run_forever(config)
+    except Exception:
+        logger.exception("Fatal error")
+        if getattr(sys, "frozen", False):
+            try:
+                input("Press Enter to exit...")
+            except Exception:
+                pass
         sys.exit(1)
 
 

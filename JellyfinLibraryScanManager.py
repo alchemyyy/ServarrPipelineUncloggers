@@ -1,11 +1,13 @@
 import http.server
+import json
+import logging
+import logging.handlers
+import os
 import socketserver
+import sys
 import threading
 import time
-import json
 import argparse
-import sys
-import logging
 from http import HTTPStatus
 
 import requests
@@ -16,6 +18,19 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("JellyfinLibraryScanManager")
+
+# Log to file so crashes leave evidence when running as a PyInstaller exe
+try:
+    _log_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    _fh = logging.handlers.RotatingFileHandler(
+        os.path.join(_log_dir, "JellyfinLibraryScanManager.log"),
+        maxBytes=5 * 1024 * 1024, backupCount=3,
+    )
+    _fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_fh)
+except Exception:
+    pass
+
 
 class JellyfinClient:
     """Talks to the Jellyfin API to discover libraries and trigger refreshes."""
@@ -68,8 +83,14 @@ class JellyfinClient:
         if resp is None:
             return False
 
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            logger.error("Jellyfin /Library/VirtualFolders returned invalid JSON")
+            return False
+
         libraries = []
-        for folder in resp.json():
+        for folder in data:
             locations = folder.get("Locations", [])
             libraries.append({
                 "id": folder.get("ItemId"),
@@ -131,8 +152,13 @@ class JellyfinClient:
         resp = self._request("GET", "/Library/VirtualFolders")
         if resp is None:
             return None
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            logger.error("Jellyfin /Library/VirtualFolders returned invalid JSON (scan status)")
+            return None
         result = {}
-        for folder in resp.json():
+        for folder in data:
             item_id = folder.get("ItemId")
             progress = folder.get("RefreshProgress")
             result[item_id] = progress is not None
@@ -207,51 +233,57 @@ class LibraryRefreshManager:
             if self._stop.is_set():
                 break
 
-            # Anything worth checking?
-            with self._lock:
-                has_active = any(s["refreshing"] for s in self._state.values())
-            if not has_active:
-                continue
+            try:
+                self._poll_tick()
+            except Exception:
+                logger.exception("Unexpected error in poll loop (will retry next cycle)")
 
-            status = self.client.get_library_scan_status()
-            if status is None:
-                continue  # API error — retry next cycle
+    def _poll_tick(self):
+        """Single iteration of the scan-status poll."""
+        with self._lock:
+            has_active = any(s["refreshing"] for s in self._state.values())
+        if not has_active:
+            return
 
-            now = time.time()
-            to_fire = []
+        status = self.client.get_library_scan_status()
+        if status is None:
+            return  # API error — retry next cycle
 
-            with self._lock:
-                for lib_id, state in self._state.items():
-                    if not state["refreshing"]:
-                        continue
+        now = time.time()
+        to_fire = []
 
-                    is_scanning = status.get(lib_id, False)
-                    hold_elapsed = (now - state["triggered_at"]) >= self._hold_seconds
+        with self._lock:
+            for lib_id, state in self._state.items():
+                if not state["refreshing"]:
+                    continue
 
-                    if is_scanning or not hold_elapsed:
-                        continue
+                is_scanning = status.get(lib_id, False)
+                hold_elapsed = (now - state["triggered_at"]) >= self._hold_seconds
 
-                    # Scan finished for this library
-                    if state["dirty"]:
-                        state["dirty"] = False
-                        state["triggered_at"] = now
-                        to_fire.append((lib_id, state["name"]))
-                        logger.info(
-                            "[%s] Scan complete — dirty flag set, triggering rescan",
-                            state["name"],
-                        )
-                    else:
-                        state["refreshing"] = False
-                        logger.info("[%s] Scan complete, queue clear", state["name"])
+                if is_scanning or not hold_elapsed:
+                    continue
 
-            # Fire queued rescans outside the lock
-            for lib_id, name in to_fire:
-                ok = self.client.refresh_library(lib_id)
-                if not ok:
-                    logger.error("[%s] Queued rescan FAILED", name)
-                    with self._lock:
-                        if lib_id in self._state:
-                            self._state[lib_id]["refreshing"] = False
+                # Scan finished for this library
+                if state["dirty"]:
+                    state["dirty"] = False
+                    state["triggered_at"] = now
+                    to_fire.append((lib_id, state["name"]))
+                    logger.info(
+                        "[%s] Scan complete — dirty flag set, triggering rescan",
+                        state["name"],
+                    )
+                else:
+                    state["refreshing"] = False
+                    logger.info("[%s] Scan complete, queue clear", state["name"])
+
+        # Fire queued rescans outside the lock
+        for lib_id, name in to_fire:
+            ok = self.client.refresh_library(lib_id)
+            if not ok:
+                logger.error("[%s] Queued rescan FAILED", name)
+                with self._lock:
+                    if lib_id in self._state:
+                        self._state[lib_id]["refreshing"] = False
 
     def stop(self):
         self._stop.set()
@@ -335,6 +367,16 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         logger.info("%s - %s", self.client_address[0], fmt % args)
 
     def do_GET(self):
+        try:
+            self._handle_get()
+        except Exception:
+            logger.exception("Unexpected error handling GET request")
+            try:
+                self._respond("Internal server error.", HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def _handle_get(self):
         path = self.path.lower().rstrip("/")
 
         if path in ("/libraries", "/status"):
@@ -361,6 +403,16 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
             )
 
     def do_POST(self):
+        try:
+            self._handle_post()
+        except Exception:
+            logger.exception("Unexpected error handling POST request")
+            try:
+                self._respond("Internal server error.", HTTPStatus.INTERNAL_SERVER_ERROR)
+            except Exception:
+                pass
+
+    def _handle_post(self):
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
             self._respond("Empty body.", HTTPStatus.BAD_REQUEST)
@@ -409,38 +461,14 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8"))
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Receives Sonarr / Radarr webhooks and triggers targeted Jellyfin "
-            "library refreshes.  Only the libraries whose source folders match "
-            "the imported media path are refreshed.  Concurrent requests for the "
-            "same library are collapsed into a single follow-up scan."
-        ),
-    )
-    parser.add_argument("-a", "--address", required=True,
-                        help="Jellyfin base URL (e.g. http://192.168.4.4:8096)")
-    parser.add_argument("-k", "--apikey", required=True,
-                        help="Jellyfin API key")
-    parser.add_argument("-H", "--host", default="0.0.0.0",
-                        help="Listen address (default: 0.0.0.0)")
-    parser.add_argument("-p", "--port", type=int, default=5000,
-                        help="Listen port (default: 5000)")
-    parser.add_argument("-i", "--poll-interval", type=int, default=3,
-                        help="Seconds between scan-status polls (default: 3)")
-    parser.add_argument("-d", "--hold-delay", type=int, default=5,
-                        help="Seconds to wait after triggering a refresh before trusting "
-                             "scan status from the API (default: 5)")
-
-    config = parser.parse_args()
-
+def _run_service(config):
+    """One run of the service — raises on failure so the retry loop can restart."""
     jellyfin = JellyfinClient(config.address, config.apikey)
     manager = LibraryRefreshManager(jellyfin, config.poll_interval, config.hold_delay)
 
     logger.info("Connecting to Jellyfin at %s ...", config.address)
     if not jellyfin.fetch_libraries():
-        logger.error("Could not reach Jellyfin. Check --address and --apikey.")
-        sys.exit(1)
+        raise ConnectionError("Could not reach Jellyfin — check --address and --apikey")
 
     WebhookHandler.jellyfin = jellyfin
     WebhookHandler.manager = manager
@@ -457,13 +485,67 @@ def main():
     poll_thread.start()
 
     try:
+        socketserver.TCPServer.allow_reuse_address = True
         with socketserver.TCPServer((config.host, config.port), WebhookHandler) as httpd:
             httpd.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down.")
     finally:
         manager.stop()
-        sys.exit(0)
+
+
+def _run_forever(config):
+    """Retry loop — restarts the service on any failure."""
+    while True:
+        try:
+            _run_service(config)
+            return  # clean shutdown (KeyboardInterrupt caught inside)
+        except KeyboardInterrupt:
+            logger.info("Shutting down.")
+            return
+        except Exception:
+            logger.exception("Service error — restarting in 10s")
+            try:
+                time.sleep(10)
+            except KeyboardInterrupt:
+                logger.info("Shutting down.")
+                return
+
+
+def main():
+    try:
+        parser = argparse.ArgumentParser(
+            description=(
+                "Receives Sonarr / Radarr webhooks and triggers targeted Jellyfin "
+                "library refreshes.  Only the libraries whose source folders match "
+                "the imported media path are refreshed.  Concurrent requests for the "
+                "same library are collapsed into a single follow-up scan."
+            ),
+        )
+        parser.add_argument("-a", "--address", required=True,
+                            help="Jellyfin base URL (e.g. http://192.168.4.4:8096)")
+        parser.add_argument("-k", "--apikey", required=True,
+                            help="Jellyfin API key")
+        parser.add_argument("-H", "--host", default="0.0.0.0",
+                            help="Listen address (default: 0.0.0.0)")
+        parser.add_argument("-p", "--port", type=int, default=5000,
+                            help="Listen port (default: 5000)")
+        parser.add_argument("-i", "--poll-interval", type=int, default=3,
+                            help="Seconds between scan-status polls (default: 3)")
+        parser.add_argument("-d", "--hold-delay", type=int, default=5,
+                            help="Seconds to wait after triggering a refresh before trusting "
+                                 "scan status from the API (default: 5)")
+
+        config = parser.parse_args()
+        _run_forever(config)
+    except Exception:
+        logger.exception("Fatal error")
+        if getattr(sys, "frozen", False):
+            try:
+                input("Press Enter to exit...")
+            except Exception:
+                pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
