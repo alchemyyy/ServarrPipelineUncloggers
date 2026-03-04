@@ -135,7 +135,11 @@ class JellyfinClient:
 
     def refresh_library(self, library_id):
         """POST /Items/{id}/Refresh to scan a single library for changes."""
-        resp = self._request("POST", f"/Items/{library_id}/Refresh")
+        resp = self._request(
+            "POST",
+            f"/Items/{library_id}/Refresh"
+            "?metadataRefreshMode=Default&imageRefreshMode=Default",
+        )
         return resp is not None
 
     def refresh_all(self):
