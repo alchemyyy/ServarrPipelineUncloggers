@@ -2,3 +2,6 @@
 build/
 dist/
 *.spec
+*.json
+*.log
+__pycache__/

@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 
 import requests
@@ -13,6 +14,66 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("ServarrIndexerForceTester")
+
+CONNECTION_FAILURE_REMINDER_SECONDS = 15 * 60
+_connection_failure_log_times = {}
+_connection_failure_lock = threading.Lock()
+_indexer_issue_states = {}
+
+
+def _is_connection_failure(exception):
+    return isinstance(exception, (requests.ConnectionError, requests.Timeout))
+
+
+def _describe_request_failure(exception):
+    if isinstance(exception, requests.Timeout):
+        return "Request timed out"
+    if isinstance(exception, requests.ConnectionError):
+        message = str(exception).casefold()
+        if "refused" in message or "10061" in message:
+            return "Connection refused"
+        if "getaddrinfo" in message or "name or service not known" in message or "11001" in message:
+            return "Host name could not be resolved"
+        return "Connection failed"
+    if isinstance(exception, requests.HTTPError) and exception.response is not None:
+        return f"HTTP {exception.response.status_code}"
+    return exception.__class__.__name__
+
+
+def _handle_request_failure(instance, operation, exception):
+    description = _describe_request_failure(exception)
+    if not _is_connection_failure(exception):
+        logger.error("[%s] %s failed: %s", instance["name"], operation, description)
+        return False
+
+    instance_key = instance["url"]
+    current_time = time.monotonic()
+    with _connection_failure_lock:
+        last_log_time = _connection_failure_log_times.get(instance_key)
+        should_log = (
+            last_log_time is None
+            or current_time - last_log_time >= CONNECTION_FAILURE_REMINDER_SECONDS
+        )
+        if should_log:
+            _connection_failure_log_times[instance_key] = current_time
+
+    if should_log:
+        logger.warning(
+            "[%s] %s while attempting to %s at %s; will retry",
+            instance["name"],
+            description,
+            operation,
+            instance["url"],
+        )
+    return True
+
+
+def _mark_connection_available(instance):
+    with _connection_failure_lock:
+        was_unavailable = _connection_failure_log_times.pop(instance["url"], None) is not None
+
+    if was_unavailable:
+        logger.info("[%s] Connection restored: %s", instance["name"], instance["url"])
 
 
 # Config
@@ -89,6 +150,7 @@ def get_health(instance):
         timeout=15,
     )
     resp.raise_for_status()
+    _mark_connection_available(instance)
     return resp.json()
 
 
@@ -99,6 +161,7 @@ def get_all_indexers(instance):
         timeout=15,
     )
     resp.raise_for_status()
+    _mark_connection_available(instance)
     return resp.json()
 
 
@@ -110,6 +173,7 @@ def test_indexer(instance, indexer_resource):
         json=indexer_resource,
         timeout=30,
     )
+    _mark_connection_available(instance)
     return resp
 
 
@@ -146,21 +210,25 @@ def check_and_test_indexers(instance):
     try:
         health = get_health(instance)
     except requests.RequestException as e:
-        logger.error("[%s] Failed to fetch health: %s", inst_name, e)
+        _handle_request_failure(instance, "fetch health", e)
         return
 
     blocked_names = parse_blocked_indexer_names(health)
     has_indexer_issues = any(h.get("source") == "IndexerStatusCheck" for h in health)
 
     if not has_indexer_issues:
-        logger.info("[%s] All indexers healthy", inst_name)
+        if _indexer_issue_states.get(instance["url"]) is not False:
+            logger.info("[%s] All indexers healthy", inst_name)
+        _indexer_issue_states[instance["url"]] = False
         return
+
+    _indexer_issue_states[instance["url"]] = True
 
     # Fetch indexers to find the ones that need testing
     try:
         indexers = get_all_indexers(instance)
     except requests.RequestException as e:
-        logger.error("[%s] Failed to fetch indexers: %s", inst_name, e)
+        _handle_request_failure(instance, "fetch indexers", e)
         return
 
     enabled = {idx["name"]: idx for idx in indexers if idx.get("enable", False)}
@@ -197,13 +265,28 @@ def check_and_test_indexers(instance):
                 logger.warning("[%s] FAIL: %s (HTTP %d)", inst_name, idx_name, resp.status_code)
                 failed += 1
         except requests.RequestException as e:
-            logger.error("[%s] ERROR testing %s: %s", inst_name, idx_name, e)
+            _handle_request_failure(instance, f"test indexer '{idx_name}'", e)
             errors += 1
 
     logger.info(
         "[%s] Test cycle complete: %d passed, %d failed, %d errors (of %d tested)",
         inst_name, passed, failed, errors, len(to_test),
     )
+
+
+def _check_initial_connectivity(instances):
+    for instance in instances:
+        try:
+            resp = requests.get(
+                f"{instance['url']}/api/v3/system/status",
+                headers=instance["headers"],
+                timeout=5,
+            )
+            resp.raise_for_status()
+            _mark_connection_available(instance)
+            logger.info("[%s] Connected OK", instance["name"])
+        except requests.RequestException as e:
+            _handle_request_failure(instance, "check system status", e)
 
 
 def main():
@@ -230,15 +313,8 @@ def main():
     logger.info("  Test interval: %d seconds", interval)
     logger.info("--------------------------------")
 
-    # Validate connectivity
-    for inst in instances:
-        try:
-            resp = requests.get(f"{inst['url']}/api/v3/system/status", headers=inst["headers"], timeout=5)
-            resp.raise_for_status()
-            logger.info("[%s] Connected OK", inst["name"])
-        except requests.RequestException as e:
-            logger.error("[%s] Cannot connect to %s: %s", inst["name"], inst["url"], e)
-            sys.exit(1)
+    # Check initial connectivity without blocking healthy instances
+    _check_initial_connectivity(instances)
 
     # Main polling loop
     logger.info("Starting test loop (every %d seconds)...", interval)

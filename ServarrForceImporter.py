@@ -5,6 +5,7 @@ import logging.handlers
 import os
 import socketserver
 import sys
+import threading
 import time
 from http import HTTPStatus
 
@@ -16,6 +17,74 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("ServarrForceImporter")
+
+CONNECTION_FAILURE_REMINDER_SECONDS = 15 * 60
+CONNECTION_RETRY_SECONDS = 60
+THREAD_SHUTDOWN_TIMEOUT_SECONDS = 5
+_connection_failure_log_times = {}
+_connection_failure_lock = threading.Lock()
+_pending_scan_instances = {}
+_pending_scan_lock = threading.Lock()
+
+
+def _is_connection_failure(exception):
+    return isinstance(exception, (requests.ConnectionError, requests.Timeout))
+
+
+def _describe_request_failure(exception):
+    if isinstance(exception, requests.Timeout):
+        return "Request timed out"
+    if isinstance(exception, requests.ConnectionError):
+        message = str(exception).casefold()
+        if "refused" in message or "10061" in message:
+            return "Connection refused"
+        if "getaddrinfo" in message or "name or service not known" in message or "11001" in message:
+            return "Host name could not be resolved"
+        return "Connection failed"
+    if isinstance(exception, requests.HTTPError) and exception.response is not None:
+        return f"HTTP {exception.response.status_code}"
+    return exception.__class__.__name__
+
+
+def _handle_request_failure(instance, operation, exception):
+    description = _describe_request_failure(exception)
+    if not _is_connection_failure(exception):
+        logger.error("[%s] %s failed: %s", instance["name"], operation, description)
+        return False
+
+    instance_key = instance["url"]
+    current_time = time.monotonic()
+    with _connection_failure_lock:
+        last_log_time = _connection_failure_log_times.get(instance_key)
+        should_log = (
+            last_log_time is None
+            or current_time - last_log_time >= CONNECTION_FAILURE_REMINDER_SECONDS
+        )
+        if should_log:
+            _connection_failure_log_times[instance_key] = current_time
+
+    if should_log:
+        logger.warning(
+            "[%s] %s while attempting to %s at %s; will retry",
+            instance["name"],
+            description,
+            operation,
+            instance["url"],
+        )
+    return True
+
+
+def _mark_connection_available(instance):
+    with _connection_failure_lock:
+        was_unavailable = _connection_failure_log_times.pop(instance["url"], None) is not None
+
+    if was_unavailable:
+        logger.info("[%s] Connection restored: %s", instance["name"], instance["url"])
+
+
+def _is_connection_unavailable(instance):
+    with _connection_failure_lock:
+        return instance["url"] in _connection_failure_log_times
 
 # Log to file so crashes leave evidence when running as a PyInstaller exe
 try:
@@ -131,6 +200,7 @@ def get_queue(instance):
         timeout=15,
     )
     resp.raise_for_status()
+    _mark_connection_available(instance)
     return resp.json().get("records", [])
 
 
@@ -142,6 +212,7 @@ def get_manual_import_files(instance, download_id):
         timeout=15,
     )
     resp.raise_for_status()
+    _mark_connection_available(instance)
     return resp.json()
 
 
@@ -153,6 +224,7 @@ def send_manual_import_command(instance, prepared_files):
         timeout=15,
     )
     resp.raise_for_status()
+    _mark_connection_available(instance)
     return resp
 
 
@@ -214,7 +286,7 @@ def handle_manual_import(instance, download_id, label):
     try:
         available_files = get_manual_import_files(instance, download_id)
     except requests.RequestException as e:
-        logger.error("[%s] Failed to get manual import files for %s: %s", inst_name, download_id, e)
+        _handle_request_failure(instance, f"get manual import files for {download_id}", e)
         return False
 
     if not available_files:
@@ -239,35 +311,69 @@ def handle_manual_import(instance, download_id, label):
         logger.info("[%s] ManualImport command accepted (HTTP %d) for downloadId=%s", inst_name, resp.status_code, download_id)
         return True
     except requests.RequestException as e:
-        logger.error("[%s] Failed to send ManualImport command for downloadId=%s: %s", inst_name, download_id, e)
+        _handle_request_failure(instance, f"send ManualImport command for {download_id}", e)
         return False
 
 
-# Startup scan — catch items already stuck before the webhook listener started
-def startup_scan(instances):
-    for instance in instances:
-        inst_name = instance["name"]
+# Startup scan - catch items already stuck before the webhook listener started
+def _startup_scan_instance(instance):
+    inst_name = instance["name"]
+    if not _is_connection_unavailable(instance):
         logger.info("[%s] Running startup queue scan...", inst_name)
 
-        try:
-            records = get_queue(instance)
-        except requests.RequestException as e:
-            logger.error("[%s] Startup scan failed to fetch queue: %s", inst_name, e)
+    try:
+        records = get_queue(instance)
+    except requests.RequestException as e:
+        _handle_request_failure(instance, "fetch queue for startup scan", e)
+        return False
+
+    completed = [r for r in records if r.get("status") == "completed"]
+    logger.info("[%s] %d completed item(s) in queue (out of %d total)", inst_name, len(completed), len(records))
+
+    imported = 0
+    for item in completed:
+        download_id = item.get("downloadId")
+        if not download_id:
             continue
+        title = item.get("title", download_id)
+        if handle_manual_import(instance, download_id, title):
+            imported += 1
+        elif _is_connection_unavailable(instance):
+            return False
 
-        completed = [r for r in records if r.get("status") == "completed"]
-        logger.info("[%s] %d completed item(s) in queue (out of %d total)", inst_name, len(completed), len(records))
+    logger.info("[%s] Startup scan complete: imported %d item(s)", inst_name, imported)
+    return True
 
-        imported = 0
-        for item in completed:
-            download_id = item.get("downloadId")
-            if not download_id:
+
+def startup_scan(instances):
+    failed_instances = []
+    for instance in instances:
+        if not _startup_scan_instance(instance):
+            failed_instances.append(instance)
+    return failed_instances
+
+
+def _queue_startup_scan_retry(instance):
+    with _pending_scan_lock:
+        _pending_scan_instances[instance["url"]] = instance
+
+
+def _retry_startup_scans(stop_event):
+    while not stop_event.wait(CONNECTION_RETRY_SECONDS):
+        with _pending_scan_lock:
+            pending_instances = list(_pending_scan_instances.values())
+
+        recovered_count = 0
+        for instance in pending_instances:
+            if not _startup_scan_instance(instance):
                 continue
-            title = item.get("title", download_id)
-            if handle_manual_import(instance, download_id, title):
-                imported += 1
 
-        logger.info("[%s] Startup scan complete: imported %d item(s)", inst_name, imported)
+            with _pending_scan_lock:
+                _pending_scan_instances.pop(instance["url"], None)
+            recovered_count += 1
+
+        if recovered_count > 0:
+            logger.info("Completed %d deferred startup/recovery queue scan(s)", recovered_count)
 
 
 class WebhookHandler(http.server.BaseHTTPRequestHandler):
@@ -368,7 +474,9 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
             label = f"{movie.get('title', '?')} ({movie.get('year', '?')})"
 
         logger.info("[%s] ManualInteractionRequired: %s (downloadId=%s)", instance["name"], label, download_id)
-        handle_manual_import(instance, download_id, label)
+        import_succeeded = handle_manual_import(instance, download_id, label)
+        if not import_succeeded and _is_connection_unavailable(instance):
+            _queue_startup_scan_retry(instance)
         self._respond("OK", HTTPStatus.OK)
 
     def _respond(self, body, status, content_type="text/plain"):
@@ -389,17 +497,40 @@ def _run_service(config):
     logger.info("  Listening on: %s:%d", host, port)
     logger.info("--------------------------")
 
-    # Validate connectivity
+    # Check initial connectivity without blocking the webhook listener
     for inst in instances:
         try:
             resp = requests.get(f"{inst['url']}/api/v3/system/status", headers=inst["headers"], timeout=5)
             resp.raise_for_status()
+            _mark_connection_available(inst)
             logger.info("[%s] Connected OK", inst["name"])
         except requests.RequestException as e:
-            raise ConnectionError(f"[{inst['name']}] Cannot connect to {inst['url']}: {e}") from e
+            _handle_request_failure(inst, "check system status", e)
 
     # Catch already-stuck items before we start listening
-    startup_scan(instances)
+    available_instances = [inst for inst in instances if not _is_connection_unavailable(inst)]
+    failed_startup_instances = [inst for inst in instances if _is_connection_unavailable(inst)]
+    failed_startup_instances.extend(startup_scan(available_instances))
+
+    with _pending_scan_lock:
+        _pending_scan_instances.clear()
+    for failed_instance in failed_startup_instances:
+        _queue_startup_scan_retry(failed_instance)
+
+    stop_event = threading.Event()
+    if failed_startup_instances:
+        logger.info(
+            "Retrying startup queue scans for %d unavailable instance(s) every %d seconds",
+            len(failed_startup_instances),
+            CONNECTION_RETRY_SECONDS,
+        )
+    retry_thread = threading.Thread(
+        target=_retry_startup_scans,
+        args=(stop_event,),
+        name="servarr-queue-scan-retry",
+        daemon=True,
+    )
+    retry_thread.start()
 
     # Start webhook server
     WebhookHandler.instances = instances
@@ -413,6 +544,9 @@ def _run_service(config):
             httpd.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down.")
+    finally:
+        stop_event.set()
+        retry_thread.join(timeout=THREAD_SHUTDOWN_TIMEOUT_SECONDS)
 
 
 def _run_forever(config):

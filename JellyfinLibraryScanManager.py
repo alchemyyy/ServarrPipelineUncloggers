@@ -9,6 +9,7 @@ import threading
 import time
 import argparse
 from http import HTTPStatus
+from urllib.parse import quote
 
 import requests
 
@@ -32,8 +33,39 @@ except Exception:
     pass
 
 
+
+def invalidate_nfs_cache(path):
+    """Force the NFS client to drop its cached directory listing for *path*.
+
+    NFS attribute caching (actimeo/acdirmin/acdirmax) tells the kernel to
+    reuse cached stat() and readdir() results for a configured duration.
+    When Sonarr/Radarr writes a new file, the NFS client may still serve a
+    stale directory listing for up to actimeo seconds — meaning Jellyfin's
+    ValidateChildren() won't see the new file even though it exists on disk.
+
+    Performing an os.listdir() on the target directory (and its parent) forces
+    the NFS client to issue a fresh READDIR RPC to the server, bypassing the
+    attribute cache for that specific directory.  This is surgically targeted:
+    it only invalidates the one directory we care about, leaving the rest of
+    the NFS cache intact for performance.
+
+    This must run on the same host where the NFS mount is active — i.e. the
+    machine running Jellyfin (or at least one that shares the same NFS mount).
+    If this script runs on a different host than the NFS client, this call is
+    a no-op (the directory won't exist locally).
+    """
+    for p in (path, os.path.dirname(path)):
+        if not p:
+            continue
+        try:
+            os.listdir(p)
+            logger.debug("NFS cache invalidated: %s", p)
+        except OSError as exc:
+            logger.debug("NFS cache invalidation skipped for %s: %s", p, exc)
+
+
 class JellyfinClient:
-    """Talks to the Jellyfin API to discover libraries and trigger refreshes."""
+    """Talks to the Jellyfin API — item-level targeted refreshes."""
 
     def __init__(self, address, api_key):
         self.address = address.rstrip("/")
@@ -41,9 +73,9 @@ class JellyfinClient:
         self._libraries = []          # [{id, name, locations, collection_type}]
         self._lock = threading.Lock()
         self._last_fetch = 0
-        self._cache_ttl = 300         # re-fetch library list every 5 min
+        self._cache_ttl = 300
 
-    # helpers
+    # -- helpers --
 
     def _url(self, endpoint):
         if not endpoint.startswith("/"):
@@ -52,7 +84,6 @@ class JellyfinClient:
 
     @staticmethod
     def _normalize(path):
-        """Lowercase, forward-slash, no trailing slash."""
         return path.replace("\\", "/").rstrip("/").lower()
 
     def _request(self, method, endpoint, **kwargs):
@@ -60,7 +91,7 @@ class JellyfinClient:
         headers.setdefault("Authorization", f'MediaBrowser Token="{self.api_key}"')
         headers.setdefault("Content-Type", "application/json")
         kwargs["headers"] = headers
-        kwargs.setdefault("timeout", 15)
+        kwargs.setdefault("timeout", 30)
         url = self._url(endpoint)
         try:
             resp = requests.request(method, url, **kwargs)
@@ -70,19 +101,56 @@ class JellyfinClient:
             logger.error("Jellyfin %s %s failed: %s", method, endpoint, exc)
             return None
 
-    # library discovery
+    # -- startup precheck --
+
+    def precheck_configuration(self):
+        """GET system config, force-set LibraryScanFanoutConcurrency, POST back."""
+        resp = self._request("GET", "/System/Configuration")
+        if resp is None:
+            logger.error("Precheck: could not read system configuration")
+            return False
+        try:
+            config = resp.json()
+        except (ValueError, TypeError):
+            logger.error("Precheck: invalid JSON from /System/Configuration")
+            return False
+
+        changed = False
+
+        current_delay = config.get("LibraryMonitorDelay", 60)
+        if current_delay != 0:
+            logger.info("Precheck: LibraryMonitorDelay %s -> 0 (instant FileSystemWatcher response)", current_delay)
+            config["LibraryMonitorDelay"] = 0
+            changed = True
+        else:
+            logger.info("Precheck: LibraryMonitorDelay already 0")
+
+        current_update = config.get("LibraryUpdateDuration", 30)
+        if current_update != 0:
+            logger.info("Precheck: LibraryUpdateDuration %s -> 0 (instant UI notification)", current_update)
+            config["LibraryUpdateDuration"] = 0
+            changed = True
+        else:
+            logger.info("Precheck: LibraryUpdateDuration already 0")
+
+        if changed:
+            resp = self._request("POST", "/System/Configuration", json=config)
+            if resp is None:
+                logger.error("Precheck: failed to update system configuration")
+                return False
+            logger.info("Precheck: system configuration updated")
+        return True
+
+    # -- library discovery --
 
     @staticmethod
     def _folder_name(path):
-        """Return the last path component, normalized to lowercase."""
         return path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
 
     def fetch_libraries(self):
-        """GET /Library/VirtualFolders and cache the result."""
         resp = self._request("GET", "/Library/VirtualFolders")
         if resp is None:
             return False
-
         try:
             data = resp.json()
         except (ValueError, TypeError):
@@ -120,10 +188,7 @@ class JellyfinClient:
         with self._lock:
             return list(self._libraries)
 
-    #folder name → library mapping
-
     def libraries_for_folder_name(self, folder_name):
-        """Return every library that has a source folder matching *folder_name*."""
         norm = folder_name.lower()
         matched = []
         for lib in self.get_libraries():
@@ -131,10 +196,117 @@ class JellyfinClient:
                 matched.append(lib)
         return matched
 
-    # refresh
+    def find_root_folder_item(self, library_id, folder_name):
+        """Find the item ID of a specific physical root folder within a library.
+
+        A library (CollectionFolder) can have multiple source locations.
+        Each one is a Folder item that is a direct child of the library.
+        Refreshing just that folder is much faster than the entire library.
+        """
+        params = {
+            "ParentId": library_id,
+            "fields": "Path",
+        }
+        resp = self._request("GET", "/Items", params=params)
+        if resp is None:
+            return None
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            return None
+
+        norm = folder_name.lower()
+        for item in data.get("Items", []):
+            item_path = item.get("Path", "")
+            if self._folder_name(item_path) == norm:
+                logger.info("Found root folder item: %s -> id=%s", item_path, item["Id"])
+                return item
+        return None
+
+    # -- item lookup --
+
+    def find_item(self, title, item_type, provider_ids=None, parent_id=None):
+        """Search Jellyfin for a Series or Movie by title, verified by provider IDs.
+
+        Searches by title via the /Items endpoint, then matches ONLY when certain:
+          1. Provider ID match (Tvdb, Tmdb, or Imdb) -- guaranteed correct
+          2. Exact title match (case-insensitive)
+
+        If neither matches, returns None so the caller falls back to a library-level
+        refresh.  We never guess — refreshing the wrong item is worse than a slightly
+        slower library scan.
+
+        provider_ids: dict like {"Tvdb": "297271", "Tmdb": "12345", "Imdb": "tt1234567"}
+        parent_id:    Jellyfin library ID to scope the search to a specific library.
+                      This matters when the same series exists in multiple libraries
+                      (e.g. "Monster" in both "TV Shows" and "Anime").
+
+        Returns the item dict (with Id, Name, Path, ProviderIds) or None.
+        """
+        if not title:
+            return None
+
+        params = {
+            "searchTerm": title,
+            "IncludeItemTypes": item_type,
+            "fields": "Path,ProviderIds",
+            "Recursive": "true",
+            "Limit": "10",
+        }
+        if parent_id:
+            params["ParentId"] = parent_id
+        resp = self._request("GET", "/Items", params=params)
+        if resp is None:
+            return None
+        try:
+            data = resp.json()
+        except (ValueError, TypeError):
+            return None
+
+        items = data.get("Items", [])
+        if not items:
+            return None
+
+        # Priority 1: match by provider ID (most reliable)
+        if provider_ids:
+            for item in items:
+                item_pids = item.get("ProviderIds", {})
+                for provider, pid in provider_ids.items():
+                    if pid and str(item_pids.get(provider, "")) == str(pid):
+                        logger.info("Matched [%s] by %s=%s -> id=%s",
+                                    item.get("Name"), provider, pid, item["Id"])
+                        return item
+
+        # Priority 2: exact title match
+        for item in items:
+            if item.get("Name", "").lower() == title.lower():
+                logger.info("Matched [%s] by exact title -> id=%s", title, item["Id"])
+                return item
+
+        # No reliable match — return None so the caller falls back to library-level refresh.
+        # We intentionally do NOT use fuzzy/best-guess matching here because refreshing the
+        # wrong item is worse than a slightly slower library-level scan.
+        logger.info("No provider ID or exact title match for [%s] among %d results — skipping targeted refresh",
+                     title, len(items))
+        return None
+
+    # -- refresh --
+
+    def refresh_item(self, item_id, item_name="?"):
+        """POST /Items/{id}/Refresh — targeted, bypasses FileRefresher chain entirely."""
+        resp = self._request(
+            "POST",
+            f"/Items/{item_id}/Refresh"
+            "?metadataRefreshMode=Default&imageRefreshMode=Default",
+        )
+        if resp is not None:
+            logger.info("Targeted refresh queued for [%s] (id=%s)", item_name, item_id)
+            return True
+        logger.error("Targeted refresh FAILED for [%s] (id=%s)", item_name, item_id)
+        return False
 
     def refresh_library(self, library_id):
-        """POST /Items/{id}/Refresh to scan a single library for changes."""
+        """POST /Items/{id}/Refresh on a library root — slower fallback."""
         resp = self._request(
             "POST",
             f"/Items/{library_id}/Refresh"
@@ -143,23 +315,16 @@ class JellyfinClient:
         return resp is not None
 
     def refresh_all(self):
-        """POST /Library/Refresh — full library scan (legacy fallback)."""
         resp = self._request("POST", "/Library/Refresh")
         return resp is not None
 
     def get_library_scan_status(self):
-        """Return {library_id: bool} — True if the library is currently scanning.
-
-        Uses RefreshProgress from /Library/VirtualFolders: when it is not None
-        the library has an active scan (global or targeted).
-        """
         resp = self._request("GET", "/Library/VirtualFolders")
         if resp is None:
             return None
         try:
             data = resp.json()
         except (ValueError, TypeError):
-            logger.error("Jellyfin /Library/VirtualFolders returned invalid JSON (scan status)")
             return None
         result = {}
         for folder in data:
@@ -169,48 +334,153 @@ class JellyfinClient:
         return result
 
 
-# flag style refresh manager
-class LibraryRefreshManager:
-    """Per-library dirty-flag queue drained by a polling loop.
+class RefreshManager:
+    """Handles targeted item refreshes with library-level fallback.
 
-    When a refresh is requested for a library that is already scanning, the
-    request is collapsed into a single "dirty" flag.  A background thread
-    polls Jellyfin for scan completion and fires one follow-up refresh per
-    dirty library once the current scan finishes.
+    On webhook:
+      1. Try to find the specific Series/Movie item in Jellyfin by provider ID or title
+      2. If found -> POST /Items/{itemId}/Refresh (fast, ~5-15s)
+      3. If NOT found (new item) -> fall back to library-level refresh
     """
 
-    def __init__(self, client, poll_interval=3, hold_seconds=5):
+    def __init__(self, client, hold_seconds=5, poll_interval=3, path_maps=None):
         self.client = client
-        self.poll_interval = poll_interval
         self._hold_seconds = hold_seconds
+        self._poll_interval = poll_interval
+        self._path_maps = path_maps or []
         self._lock = threading.Lock()
-        # library_id -> {refreshing: bool, dirty: bool, name: str, triggered_at: float}
-        self._state = {}
+        # library_id -> {refreshing, dirty, name, triggered_at}  (only for library-level fallbacks)
+        self._lib_state = {}
         self._stop = threading.Event()
+        # stats
+        self._stats = {"targeted": 0, "library_fallback": 0, "failed": 0}
 
-    # -- called by webhook handler
+    def _translate_path(self, path):
+        """Apply --path-map rules to convert a webhook path to a local NFS path.
 
-    def request_refresh(self, library_id, library_name):
-        """Request a scan for *library_id*.
-
-        If the library is not currently scanning, fire immediately.
-        If it is, set the dirty flag so the poll loop fires a follow-up.
+        Sonarr/Radarr run in containers with their own mount layout (e.g.
+        /data/tv/ShowName) but the NFS mount on this host may be at a
+        different path (e.g. /shares/video/tv/ShowName).  The --path-map
+        flag lets you bridge this gap so invalidate_nfs_cache() hits the
+        right directory on the local filesystem.
         """
+        if not path:
+            return path
+        norm = path.replace("\\", "/")
+        for remote, local in self._path_maps:
+            remote_norm = remote.replace("\\", "/")
+            if norm.startswith(remote_norm + "/") or norm == remote_norm:
+                translated = local + norm[len(remote_norm):]
+                logger.debug("Path translated: %s -> %s", path, translated)
+                return translated
+        return path
+
+    def request_targeted_refresh(self, media_info):
+        """Try to refresh a specific item; fall back to library-level if not found.
+
+        media_info: dict with keys title, item_type, root_folder_name,
+                    and optionally tvdb_id, tmdb_id, imdb_id.
+        Returns a status string.
+        """
+        title = media_info.get("title")
+        item_type = media_info.get("item_type")  # "Series" or "Movie"
+
+        # Step 0: bust NFS attribute cache for the media directory so Jellyfin
+        # sees the new file immediately instead of a stale cached listing.
+        # The webhook path (from Sonarr/Radarr's container) is translated to
+        # the local NFS mount path via --path-map rules before invalidation.
+        media_path = media_info.get("media_path")
+        if media_path:
+            local_path = self._translate_path(media_path)
+            invalidate_nfs_cache(local_path)
+
+        # Step 1: resolve the target library so we scope the search correctly.
+        # This prevents matching the wrong copy when the same series exists in
+        # multiple libraries (e.g. "Monster" in both "TV Shows" and "Anime").
+        root_folder = media_info.get("root_folder_name")
+        library_id = None
+        if root_folder:
+            matched_libs = self.client.libraries_for_folder_name(root_folder)
+            if matched_libs:
+                library_id = matched_libs[0]["id"]
+
+        # Step 2: search by title within that library, verify by provider IDs
+        provider_ids = {}
+        for provider, key in [("Tvdb", "tvdb_id"), ("Tmdb", "tmdb_id"), ("Imdb", "imdb_id")]:
+            pid = media_info.get(key)
+            if pid:
+                provider_ids[provider] = str(pid)
+
+        item = self.client.find_item(title, item_type, provider_ids or None, parent_id=library_id)
+
+        # Step 3: targeted refresh if found
+        if item:
+            ok = self.client.refresh_item(item["Id"], item.get("Name", title))
+            if ok:
+                with self._lock:
+                    self._stats["targeted"] += 1
+                return f"targeted:{item.get('Name', title)}"
+            with self._lock:
+                self._stats["failed"] += 1
+            return "failed"
+
+        # Step 4: item not found in Jellyfin — fall back to library-level refresh
+        logger.info("[%s] not found in Jellyfin — falling back to library-level refresh", title)
+        return self._library_fallback(media_info)
+
+    def _library_fallback(self, media_info):
+        """Refresh the specific root folder within the library (not the whole library).
+
+        A library can have multiple source locations (e.g. /media/tv, /media/anime).
+        We find the specific root folder item and refresh just that one, which scopes
+        ValidateChildren to only that directory tree instead of the entire library.
+        Falls back to full library refresh if the root folder item can't be found.
+        """
+        root_folder = media_info.get("root_folder_name")
+        if not root_folder:
+            logger.warning("No root folder name — cannot determine library")
+            with self._lock:
+                self._stats["failed"] += 1
+            return "failed:no_root_folder"
+
+        matched = self.client.libraries_for_folder_name(root_folder)
+        if not matched:
+            logger.warning("No library matched folder '%s' — triggering full scan", root_folder)
+            ok = self.client.refresh_all()
+            with self._lock:
+                self._stats["library_fallback"] += 1
+            return f"full_scan:{'ok' if ok else 'failed'}"
+
+        results = []
+        for lib in matched:
+            # Try to scope the refresh to just the matching root folder
+            root_item = self.client.find_root_folder_item(lib["id"], root_folder)
+            if root_item:
+                refresh_id = root_item["Id"]
+                refresh_label = f"{lib['name']}/{root_folder}"
+                logger.info("Scoped fallback to root folder [%s] (id=%s)", refresh_label, refresh_id)
+            else:
+                refresh_id = lib["id"]
+                refresh_label = lib["name"]
+                logger.info("Could not find root folder item, refreshing entire library [%s]", lib["name"])
+            result = self._request_library_refresh(refresh_id, refresh_label)
+            results.append(f"{refresh_label}:{result}")
+
+        with self._lock:
+            self._stats["library_fallback"] += 1
+        return ";".join(results)
+
+    def _request_library_refresh(self, library_id, library_name):
         fire = False
         with self._lock:
-            state = self._state.get(library_id)
+            state = self._lib_state.get(library_id)
             if state is None:
-                state = {
-                    "refreshing": False,
-                    "dirty": False,
-                    "name": library_name,
-                    "triggered_at": 0,
-                }
-                self._state[library_id] = state
+                state = {"refreshing": False, "dirty": False, "name": library_name, "triggered_at": 0}
+                self._lib_state[library_id] = state
 
             if state["refreshing"]:
                 state["dirty"] = True
-                logger.info("[%s] Scan in progress — marked dirty", library_name)
+                logger.info("[%s] Library scan in progress — marked dirty", library_name)
                 return "queued"
             else:
                 state["refreshing"] = True
@@ -221,151 +491,157 @@ class LibraryRefreshManager:
         if fire:
             ok = self.client.refresh_library(library_id)
             if ok:
-                logger.info("[%s] Refresh triggered", library_name)
+                logger.info("[%s] Library-level refresh triggered", library_name)
                 return "triggered"
             else:
                 with self._lock:
-                    self._state[library_id]["refreshing"] = False
-                logger.error("[%s] Refresh FAILED", library_name)
+                    self._lib_state[library_id]["refreshing"] = False
                 return "failed"
 
-    # -- background poll loop
+    # -- background poll loop for library-level fallback tracking --
+
     def poll_loop(self):
-        """Monitor scan status and drain the dirty queue."""
         while not self._stop.is_set():
-            self._stop.wait(self.poll_interval)
+            self._stop.wait(self._poll_interval)
             if self._stop.is_set():
                 break
-
             try:
                 self._poll_tick()
             except Exception:
-                logger.exception("Unexpected error in poll loop (will retry next cycle)")
+                logger.exception("Error in poll loop")
 
     def _poll_tick(self):
-        """Single iteration of the scan-status poll."""
         with self._lock:
-            has_active = any(s["refreshing"] for s in self._state.values())
+            has_active = any(s["refreshing"] for s in self._lib_state.values())
         if not has_active:
             return
 
         status = self.client.get_library_scan_status()
         if status is None:
-            return  # API error — retry next cycle
+            return
 
         now = time.time()
         to_fire = []
 
         with self._lock:
-            for lib_id, state in self._state.items():
+            for lib_id, state in self._lib_state.items():
                 if not state["refreshing"]:
                     continue
-
                 is_scanning = status.get(lib_id, False)
                 hold_elapsed = (now - state["triggered_at"]) >= self._hold_seconds
-
                 if is_scanning or not hold_elapsed:
                     continue
-
-                # Scan finished for this library
                 if state["dirty"]:
                     state["dirty"] = False
                     state["triggered_at"] = now
                     to_fire.append((lib_id, state["name"]))
-                    logger.info(
-                        "[%s] Scan complete — dirty flag set, triggering rescan",
-                        state["name"],
-                    )
+                    logger.info("[%s] Library scan complete — dirty, triggering rescan", state["name"])
                 else:
                     state["refreshing"] = False
-                    logger.info("[%s] Scan complete, queue clear", state["name"])
+                    logger.info("[%s] Library scan complete, queue clear", state["name"])
 
-        # Fire queued rescans outside the lock
         for lib_id, name in to_fire:
             ok = self.client.refresh_library(lib_id)
             if not ok:
-                logger.error("[%s] Queued rescan FAILED", name)
+                logger.error("[%s] Queued library rescan FAILED", name)
                 with self._lock:
-                    if lib_id in self._state:
-                        self._state[lib_id]["refreshing"] = False
+                    if lib_id in self._lib_state:
+                        self._lib_state[lib_id]["refreshing"] = False
 
     def stop(self):
         self._stop.set()
 
     def get_status(self):
-        """Snapshot of current state for the debug endpoint."""
         with self._lock:
-            return {lid: dict(s) for lid, s in self._state.items()}
+            return {
+                "stats": dict(self._stats),
+                "library_queue": {lid: dict(s) for lid, s in self._lib_state.items()},
+            }
 
 
-# Webhook payload parsing
+# -- Webhook payload parsing --
+
 def _parent_folder_name(path):
-    """Extract the last component of the parent directory, lowercased.
-
-    Sonarr:  series.path  = /data/autotelevision/Show Name  → autotelevision
-    Radarr:  movie.folderPath = /data/automovies/Movie (2024) → automovies
-    """
+    """Last component of the parent directory, lowercased."""
     norm = path.replace("\\", "/").rstrip("/")
     parent = norm.rsplit("/", 1)[0] if "/" in norm else norm
     return parent.rsplit("/", 1)[-1].lower()
 
 
-def extract_root_folder_name(payload):
-    """Derive the root/library folder name from a Sonarr or Radarr webhook.
+def extract_media_info(payload):
+    """Extract structured media info from a Sonarr or Radarr webhook.
 
-    The webhook provides the series/movie path (e.g. /data/autotv/Show Name).
-    The parent of that path is the root folder, and its last component is the
-    folder name we match against Jellyfin library source folder names.
+    Returns a dict with: title, item_type, root_folder_name,
+    and optionally tvdb_id, tmdb_id, imdb_id.
     """
     event_type = payload.get("eventType", "Unknown")
+    info = {"event_type": event_type}
 
-    # Sonarr — series.path is the series directory; parent is the root folder
+    # -- Sonarr --
     series = payload.get("series")
     if series:
+        info["title"] = series.get("title", "")
+        info["item_type"] = "Series"
+        info["tvdb_id"] = series.get("tvdbId")
+        info["imdb_id"] = series.get("imdbId")
+        info["tmdb_id"] = series.get("tmdbId")
+
         path = series.get("path")
         if path:
-            name = _parent_folder_name(path)
-            logger.info("Sonarr [%s] series.path = %s -> root folder: %s", event_type, path, name)
-            return name
+            info["root_folder_name"] = _parent_folder_name(path)
+            info["media_path"] = path
+            logger.info("Sonarr [%s] '%s' path=%s root=%s tvdb=%s",
+                        event_type, info["title"], path,
+                        info.get("root_folder_name"), info.get("tvdb_id"))
+        return info
 
-    # Radarr — movie.folderPath is the movie directory; parent is the root folder
+    # -- Radarr --
     movie = payload.get("movie")
     if movie:
+        info["title"] = movie.get("title", "")
+        info["item_type"] = "Movie"
+        info["tmdb_id"] = movie.get("tmdbId")
+        info["imdb_id"] = movie.get("imdbId")
+
         path = movie.get("folderPath") or movie.get("path")
         if path:
-            name = _parent_folder_name(path)
-            logger.info("Radarr [%s] movie.folderPath = %s -> root folder: %s", event_type, path, name)
-            return name
+            info["root_folder_name"] = _parent_folder_name(path)
+            info["media_path"] = path
+            logger.info("Radarr [%s] '%s' path=%s root=%s tmdb=%s",
+                        event_type, info["title"], path,
+                        info.get("root_folder_name"), info.get("tmdb_id"))
+        return info
 
-    # Fallback: derive from file path (go up two levels: file -> media dir -> root)
+    # -- Fallback: derive from file path --
     for key in ("episodeFile", "movieFile"):
         file_obj = payload.get(key)
         if file_obj:
             fp = file_obj.get("path")
             if fp:
-                # file -> series/movie dir -> root folder
                 media_dir = fp.replace("\\", "/").rstrip("/").rsplit("/", 1)[0]
-                name = _parent_folder_name(media_dir)
-                logger.info("Derived root folder from %s.path: %s", key, name)
-                return name
+                info["root_folder_name"] = _parent_folder_name(media_dir)
+                info["media_path"] = media_dir
+                info.setdefault("item_type", "Movie" if key == "movieFile" else "Series")
+                logger.info("Derived media info from %s.path: root=%s", key, info["root_folder_name"])
+                return info
 
-    # Bulk import
     dest = payload.get("destinationPath")
     if dest:
-        name = _parent_folder_name(dest)
-        logger.info("Root folder from destinationPath: %s", name)
-        return name
+        info["root_folder_name"] = _parent_folder_name(dest)
+        info["media_path"] = dest
+        logger.info("Root folder from destinationPath: %s", info["root_folder_name"])
+        return info
 
-    logger.warning("Could not extract root folder from %s webhook", event_type)
+    logger.warning("Could not extract media info from %s webhook", event_type)
     return None
 
 
-# HTTP handler
+# -- HTTP handler --
+
 class WebhookHandler(http.server.BaseHTTPRequestHandler):
 
-    # Attached to the class by main() before the server starts.
     jellyfin: JellyfinClient
-    manager: LibraryRefreshManager
+    manager: RefreshManager
 
     def log_message(self, fmt, *args):
         logger.info("%s - %s", self.client_address[0], fmt % args)
@@ -374,7 +650,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         try:
             self._handle_get()
         except Exception:
-            logger.exception("Unexpected error handling GET request")
+            logger.exception("Error handling GET")
             try:
                 self._respond("Internal server error.", HTTPStatus.INTERNAL_SERVER_ERROR)
             except Exception:
@@ -386,23 +662,22 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         if path in ("/libraries", "/status"):
             self.jellyfin.fetch_libraries()
             body = json.dumps(
-                {"libraries": self.jellyfin.get_libraries(), "queue": self.manager.get_status()},
-                indent=2,
-                default=str,
+                {"libraries": self.jellyfin.get_libraries(), "manager": self.manager.get_status()},
+                indent=2, default=str,
             )
             self._respond(body, HTTPStatus.OK, "application/json")
 
         elif "jellyfin" in path:
             ok = self.jellyfin.refresh_all()
-            msg = "Full library refresh triggered." if ok else "Failed to trigger full refresh."
+            msg = f"Full library refresh {'triggered' if ok else 'FAILED'}."
             self._respond(msg, HTTPStatus.OK)
 
         else:
             self._respond(
                 "Endpoints:\n"
-                "  POST /          — Sonarr / Radarr webhook (targeted refresh)\n"
-                "  GET  /libraries  — show library mapping + queue status\n"
-                "  GET  /jellyfin   — trigger a full library refresh\n",
+                "  POST /          — Sonarr / Radarr webhook (targeted item refresh)\n"
+                "  GET  /status    — show library mapping + manager status\n"
+                "  GET  /jellyfin  — trigger a full library refresh\n",
                 HTTPStatus.OK,
             )
 
@@ -410,7 +685,7 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
         try:
             self._handle_post()
         except Exception:
-            logger.exception("Unexpected error handling POST request")
+            logger.exception("Error handling POST")
             try:
                 self._respond("Internal server error.", HTTPStatus.INTERNAL_SERVER_ERROR)
             except Exception:
@@ -438,25 +713,17 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
             self._respond("Test webhook received.", HTTPStatus.OK)
             return
 
-        folder_name = extract_root_folder_name(payload)
-        if not folder_name:
-            self._respond("Acknowledged (no root folder to map).", HTTPStatus.OK)
+        media_info = extract_media_info(payload)
+        if not media_info:
+            self._respond("Acknowledged (could not extract media info).", HTTPStatus.OK)
             return
 
-        matched = self.jellyfin.libraries_for_folder_name(folder_name)
-        if not matched:
-            logger.warning("No Jellyfin library matched folder name: %s — falling back to full scan", folder_name)
-            ok = self.jellyfin.refresh_all()
-            msg = f"No library matched '{folder_name}', full refresh {'triggered' if ok else 'FAILED'}"
-            self._respond(msg, HTTPStatus.OK)
+        if not media_info.get("title") and not media_info.get("root_folder_name"):
+            self._respond("Acknowledged (no title or root folder).", HTTPStatus.OK)
             return
 
-        lines = []
-        for lib in matched:
-            result = self.manager.request_refresh(lib["id"], lib["name"])
-            lines.append(f"{lib['name']}: {result}")
-
-        self._respond("\n".join(lines), HTTPStatus.OK)
+        result = self.manager.request_targeted_refresh(media_info)
+        self._respond(result, HTTPStatus.OK)
 
     def _respond(self, body, status, content_type="text/plain"):
         self.send_response(status)
@@ -466,13 +733,16 @@ class WebhookHandler(http.server.BaseHTTPRequestHandler):
 
 
 def _run_service(config):
-    """One run of the service — raises on failure so the retry loop can restart."""
     jellyfin = JellyfinClient(config.address, config.apikey)
-    manager = LibraryRefreshManager(jellyfin, config.poll_interval, config.hold_delay)
+    manager = RefreshManager(jellyfin, config.hold_delay, config.poll_interval,
+                             path_maps=getattr(config, "path_maps", []))
 
     logger.info("Connecting to Jellyfin at %s ...", config.address)
     if not jellyfin.fetch_libraries():
         raise ConnectionError("Could not reach Jellyfin — check --address and --apikey")
+
+    # Startup precheck: force-set LibraryScanFanoutConcurrency
+    jellyfin.precheck_configuration()
 
     WebhookHandler.jellyfin = jellyfin
     WebhookHandler.manager = manager
@@ -481,6 +751,13 @@ def _run_service(config):
     logger.info("Jellyfin : %s", config.address)
     logger.info("Listen   : %s:%d", config.host, config.port)
     logger.info("Poll     : every %ds", config.poll_interval)
+    logger.info("Strategy : targeted item refresh -> library fallback for new items")
+    if config.path_maps:
+        logger.info("Path maps: %d configured (for NFS cache invalidation)", len(config.path_maps))
+        for remote, local in config.path_maps:
+            logger.info("  %s -> %s", remote, local)
+    else:
+        logger.info("Path maps: none (NFS invalidation uses webhook paths as-is)")
     logger.info("---")
     logger.info("Point your Sonarr / Radarr webhook to: http://<this-host>:%d/", config.port)
     logger.info("---")
@@ -499,11 +776,10 @@ def _run_service(config):
 
 
 def _run_forever(config):
-    """Retry loop — restarts the service on any failure."""
     while True:
         try:
             _run_service(config)
-            return  # clean shutdown (KeyboardInterrupt caught inside)
+            return
         except KeyboardInterrupt:
             logger.info("Shutting down.")
             return
@@ -521,9 +797,10 @@ def main():
         parser = argparse.ArgumentParser(
             description=(
                 "Receives Sonarr / Radarr webhooks and triggers targeted Jellyfin "
-                "library refreshes.  Only the libraries whose source folders match "
-                "the imported media path are refreshed.  Concurrent requests for the "
-                "same library are collapsed into a single follow-up scan."
+                "item-level refreshes.  Bypasses Jellyfin's slow FileRefresher "
+                "debounce chain by calling POST /Items/{id}/Refresh directly on "
+                "the specific Series or Movie item.  Falls back to library-level "
+                "refresh for items not yet known to Jellyfin."
             ),
         )
         parser.add_argument("-a", "--address", required=True,
@@ -539,8 +816,21 @@ def main():
         parser.add_argument("-d", "--hold-delay", type=int, default=5,
                             help="Seconds to wait after triggering a refresh before trusting "
                                  "scan status from the API (default: 5)")
+        parser.add_argument("-m", "--path-map", action="append", default=[],
+                            metavar="REMOTE=LOCAL",
+                            help="Map webhook paths to local NFS mount paths for cache "
+                                 "invalidation. Can be specified multiple times. "
+                                 "Example: -m /data/tv=/shares/video/tv "
+                                 "-m /data/movies=/shares/video/movies")
 
         config = parser.parse_args()
+        config.path_maps = []
+        for mapping in config.path_map:
+            if "=" not in mapping:
+                parser.error(f"Invalid --path-map format: {mapping!r} (expected REMOTE=LOCAL)")
+            remote, local = mapping.split("=", 1)
+            config.path_maps.append((remote.rstrip("/"), local.rstrip("/")))
+            logger.info("Path map: %s -> %s", remote, local)
         _run_forever(config)
     except Exception:
         logger.exception("Fatal error")

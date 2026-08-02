@@ -1,0 +1,81 @@
+File appears on disk
+    │
+    ├─ Path A: FileSystemWatcher event ──┐
+    │                                     │
+    ├─ Path B: POST /Library/Media/Updated ──> ReportFileSystemChanged(path)
+    │                                              │
+    │                                    ┌─────────┘
+    │                                    ▼
+    │                          CreateRefresher(path)
+    │                              │
+    │                    FileRefresher debounce timer
+    │                    (LibraryMonitorDelay seconds) ◄── YOU SET THIS TO 5s ✓
+    │                              │
+    │                    OnTimerCallback fires
+    │                              │
+    │                    GetAffectedBaseItem(path)
+    │                    ── walks UP the directory tree calling
+    │                       FindByPath() until it finds a known item
+    │                              │
+    │                    item.ChangedExternally()
+    │                              │
+    │                    ProviderManager.QueueRefresh(id, High)
+    │                              │                              
+    │                    ┌─────────┘
+    │                    ▼
+    │           StartProcessingRefreshQueue()
+    │           ── SEQUENTIAL processing, one item at a time
+    │           ── if queue has backlog, your item WAITS
+    │                    │
+    │           item.RefreshMetadata() ── hits TMDB/TVDB over HTTP
+    │                    │
+    │           folder.ValidateChildren() ── full directory walk + DB diff
+    │                    │
+    │           LibraryManager fires ItemAdded/Updated events
+    │                    │
+    │           LibraryChangedNotifier batches events
+    │           (LibraryUpdateDuration seconds) ◄── YOU SET THIS TO 5s ✓
+    │                    │
+    │           WebSocket "LibraryChanged" → UI updates
+    └──────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+    The Three Real Bottlenecks
+
+**1. The refresh queue is single-threaded sequential** (`ProviderManager.cs:1038`)
+
+```csharp
+while (_refreshQueue.TryDequeue(out var refreshItem, out _))
+{
+    // processes ONE item at a time
+    await RefreshItem(item, refreshItem.RefreshOptions, cancellationToken);
+}
+```
+
+If *anything* else is already refreshing (background metadata, trickplay extraction, another scan), your newly-detected item sits in the queue waiting. There is no parallelism here despite the `LibraryMetadataRefreshConcurrency` setting existing — that setting controls *provider* concurrency within a single refresh, not queue concurrency.
+
+**2. `ValidateChildren` does a full directory walk + DB diff** (`ProviderManager.cs:1086`)
+
+When `RefreshItem` processes a `Folder`, it calls `folder.ValidateChildren()` which:
+- Lists every file in the folder recursively
+- Queries the DB for all known children
+- Diffs them to find adds/removes/changes
+- Creates DB entries for new items
+- For each new item, queues *another* refresh (metadata fetch)
+
+**3. Sibling-coalescing in `CreateRefresher` escalates scope** (`LibraryMonitor.cs:412-418`)
+
+```csharp
+// They are siblings. Rebase the refresher to the parent folder.
+if (parentPath is not null
+    && Path.GetDirectoryName(refresher.Path.AsSpan()).Equals(parentPath, StringComparison.Ordinal))
+{
+    refresher.ResetPath(parentPath, path);
+    return;
+}
